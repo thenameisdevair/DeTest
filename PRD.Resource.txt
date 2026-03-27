@@ -1,0 +1,516 @@
+# DeTest — Product Requirements Document
+# PRD.Resource.txt
+# Version: 0.1.0
+# Status: Draft
+# Repository: https://github.com/thenameisdevair/DeTest
+
+---
+
+## 1. WHAT IS DETEST
+
+DeTest is a Claude Code skill. It is a Foundry test verification layer that sits downstream of the pashov/skills solidity-auditor. It does not discover vulnerabilities. It takes pashov's findings and attempts to prove or disprove each one by writing, running, and iterating on Foundry tests.
+
+The core thesis: a finding that cannot be demonstrated with a passing Foundry test is unconfirmed. A finding with a passing test is evidence. DeTest produces evidence, not opinions.
+
+DeTest is invoked as a Claude Code skill command: /detest
+
+---
+
+## 2. THE PIPELINE
+
+Step 1 — Pashov runs on the target codebase.
+Step 2 — Pashov saves its report to: assets/findings/{project-name}-pashov-ai-audit-report-{YYYYMMDD-HHMMSS}.md
+Step 3 — DeTest reads the most recent report file from that path.
+Step 4 — DeTest reads all in-scope .sol source files to understand the codebase.
+Step 5 — DeTest classifies each finding by testability (see Section 5).
+Step 6 — For each testable finding, DeTest writes a .t.sol Foundry test file.
+Step 7 — DeTest runs: forge test --match-path {test_file} -vvvv
+Step 8 — DeTest reads the forge output and interprets the result.
+Step 9 — If the test fails to compile or run, DeTest iterates (max 3 attempts per finding).
+Step 10 — DeTest emits a final verdict report.
+
+---
+
+## 3. INPUT FORMAT — PASHOV REPORT
+
+DeTest reads the pashov markdown report. Each finding has the following fields:
+
+FINDING fields:
+- confidence score: [0-100] integer
+- title: short vulnerability name
+- contract: contract name
+- function: function name
+- bug_class: kebab-tag (e.g. reentrancy, access-control, integer-overflow)
+- path: caller → function → state change → impact
+- proof: concrete values/trace from the actual code
+- description: one sentence
+- fix: one-sentence suggestion
+
+LEAD fields (lower confidence, partial path):
+- title
+- contract.function
+- code_smells
+- description
+
+DeTest processes FINDINGs first, then LEADs if time permits. LEADs get one attempt only, no iteration.
+
+---
+
+## 4. FOUNDRY TOOLSET — AVAILABLE TO DETEST
+
+DeTest has access to the full Foundry suite. Below is a precise mapping of what is available, what we use, and what we do not use.
+
+### 4.1 forge test — PRIMARY TOOL
+
+All DeTest test execution happens via forge test. Never forge script.
+
+Test types DeTest can write:
+
+UNIT TESTS
+- Function prefix: test_ or test
+- Inherits: forge-std/Test.sol
+- Used for: deterministic single-scenario exploit proofs
+- Run command: forge test --match-path test/detest/{filename}.t.sol -vvvv
+
+FUZZ TESTS
+- Function signature takes typed parameters (e.g. uint256 amount)
+- Forge automatically fuzzes with 256 runs default
+- Used for: integer overflow/underflow edge cases, arithmetic bugs, boundary conditions
+- Configurable in foundry.toml: [fuzz] runs = 512
+- Use bound(value, min, max) to clamp inputs, not vm.assume() — bound() is more efficient
+- Run command: forge test --match-test testFuzz_ -vvvv
+
+INVARIANT TESTS
+- Function prefix: invariant_
+- Requires handler contract pattern (see Section 6.3)
+- Used for: solvency invariants, conservation laws, supply accounting, access control properties that must hold across arbitrary call sequences
+- Configuration in foundry.toml: [invariant] runs = 256, depth = 500, fail_on_revert = false
+- Ghost variables track cumulative state in handler
+- Run command: forge test --match-contract {InvariantTest} -vvvv
+
+TABLE TESTS (Foundry v1.3.0+)
+- Function prefix: table
+- Parameters must match fixture array names
+- Used for: testing multiple exploit parameter combinations against same vulnerability
+- Only use when a finding needs to prove the bug across multiple input scenarios
+
+### 4.2 CHEATCODES — vm.* object
+
+STATE MANIPULATION (use freely):
+- vm.prank(address) — impersonate one call as address. CRITICAL for access control tests.
+- vm.startPrank(address) / vm.stopPrank() — impersonate multiple calls
+- vm.deal(address, uint256) — give ETH to any address
+- vm.store(address, bytes32 slot, bytes32 value) — write raw storage slot directly. Use for forcing contract state that cannot be set through normal function calls.
+- vm.load(address, bytes32 slot) — read raw storage slot
+- vm.warp(uint256 timestamp) — set block.timestamp. CRITICAL for timelock, vesting, deadline bugs.
+- vm.roll(uint256 blockNumber) — set block.number
+- vm.fee(uint256 basefee) — set block.basefee
+- vm.chainId(uint256 id) — set block.chainid. CRITICAL for cross-chain replay tests.
+
+ASSERTIONS (use precisely):
+- vm.expectRevert() — assert next call reverts (any reason)
+- vm.expectRevert(bytes4 selector) — assert reverts with specific custom error
+- vm.expectRevert(string) — assert reverts with specific string reason
+- vm.expectEmit(bool, bool, bool, bool) — assert specific event emitted. Four booleans = check topic1, topic2, topic3, data.
+- vm.expectCall(address, bytes) — assert a specific call is made
+
+MOCKING (use for oracle and external dependency tests):
+- vm.mockCall(address target, bytes calldata, bytes returnData) — intercept any call to target matching calldata and return fake data. CRITICAL for Chainlink oracle manipulation tests, price feed staleness tests.
+- vm.mockCallRevert(address target, bytes calldata, bytes revertData) — mock a call to revert
+- vm.clearMockedCalls() — reset all mocks after test
+
+FORKING (use only for FORK category findings):
+- vm.createFork(string url) — returns forkId, does not activate
+- vm.selectFork(uint256 forkId) — activate a fork
+- vm.createSelectFork(string url) — create and activate in one call
+- vm.createSelectFork(string url, uint256 blockNumber) — pin to specific block for reproducibility
+- deal(address token, address to, uint256 amount) — set ERC20 balance on fork. Preferred over acquiring tokens through protocol. Adjusts totalSupply when needed: deal(token, to, amount, true)
+
+UTILITIES:
+- makeAddr(string) — create deterministic address from label string. Use for test actors: address attacker = makeAddr("attacker")
+- vm.label(address, string) — label addresses for readable traces
+- bound(uint256 value, uint256 min, uint256 max) — clamp fuzz inputs to valid range
+- vm.assume(bool) — skip fuzz run if condition false. Use sparingly, prefer bound().
+
+FFI:
+- vm.ffi(string[]) — execute shell command from test
+- POLICY: DeTest does NOT use FFI. It requires ffi = true in foundry.toml which is a security risk. Slither is run separately before DeTest, not from inside tests.
+
+### 4.3 VERBOSITY — HOW DETEST READS FORGE OUTPUT
+
+DeTest always runs forge test with -vvvv. This produces:
+- Full call traces for all tests including passing ones
+- Gas costs per call in brackets
+- Return values and revert reasons
+- Call hierarchy showing the full execution path
+
+DeTest reads this output to determine:
+- Did the test PASS or FAIL?
+- If FAIL: was it a compilation error, assertion failure, or unexpected revert?
+- If PASS: does the trace confirm the exploit path matches pashov's proof field?
+
+### 4.4 TOOLS DETEST DOES NOT USE
+
+Anvil: Anvil is a local node for interactive development. DeTest uses forge test directly. Anvil is not part of the DeTest pipeline.
+
+Cast: Cast is a CLI tool for manual chain interaction. DeTest does not use Cast inside its test generation loop.
+
+Chisel: Chisel is an interactive Solidity REPL. Not relevant to DeTest.
+
+forge script: forge script is for deployment. DeTest never uses forge script.
+
+---
+
+## 5. TESTABILITY CLASSIFICATION
+
+Before writing any test, DeTest classifies each finding into one of four categories. Classification is based on bug_class and the proof field. This is a hard gate — DeTest does not write tests for UNTESTABLE findings.
+
+### CATEGORY 1: STANDARD
+Testable using only Foundry cheatcodes. No external RPC required. No mock infrastructure beyond simple mock contracts.
+
+Bug classes that are STANDARD:
+- reentrancy (single-function, cross-function, read-only, ERC777, ERC721/1155 callback)
+- access-control (missing modifier, wrong role, tx.origin auth)
+- integer-overflow, integer-underflow, unsafe-downcast, precision-loss
+- signature-replay, missing-nonce, signature-malleability, missing-chainid
+- erc20-return-value, fee-on-transfer, zero-amount-transfer
+- storage-collision (proxy-impl overlap, diamond facet)
+- time-manipulation (vm.warp for timelocks, vesting, deadlines)
+- array-delete-gap, duplicate-array-input, off-by-one
+- merkle-proof-reuse, commit-reveal-frontrun
+- governance-snapshot (when token is local — uses vm.roll)
+- erc4626-rounding, erc4626-inflation-attack
+- missing-slippage-parameter (prove minAmountOut=0 passes)
+- self-liquidation, repeated-liquidation
+- reward-accounting (double-claim, stale-debt, phantom-rewards)
+- emit-missing, dead-code-after-return
+- arbitrary-delegatecall, arbitrary-external-call (when target is local)
+- uups-missing-auth, proxy-initialization-frontrun
+- create2-zero-check, ecrecover-zero-check
+
+### CATEGORY 2: FORK
+Testable but requires vm.createFork() with a mainnet RPC URL. DeTest checks for eth_rpc_url in foundry.toml or FOUNDRY_RPC_URL environment variable before attempting. If not present, downgrades to INCONCLUSIVE with reason: "fork required, no RPC configured."
+
+Bug classes that are FORK:
+- chainlink-staleness (needs live Chainlink aggregator)
+- spot-price-oracle (needs real AMM reserves)
+- lst-depeg (needs stETH, wstETH contracts)
+- twap-manipulation (needs live Uniswap pool)
+- aave-liquidation-path (needs live Aave pool)
+- token-blacklist-dos (needs real USDC/USDT)
+- fee-on-transfer-accounting (for real FOT tokens like PAXG)
+- rebasing-token-accounting (needs stETH or AMPL)
+
+### CATEGORY 3: MOCK
+Testable by deploying a simplified mock contract that simulates an external dependency. No fork needed. DeTest writes the mock inline in the test file.
+
+Bug classes that are MOCK:
+- flash-loan-callback (deploy MockLendingPool that calls onFlashLoan)
+- flash-loan-governance (deploy MockToken that flash-mints)
+- bridge-message-spoofing (deploy MockEndpoint, call lzReceive directly)
+- cross-chain-replay (deploy MockBridge, replay same message hash)
+- lzcompose-spoofing (call lzCompose directly without real endpoint)
+- erc777-reentrancy (deploy MockERC777 with tokensToSend hook)
+- non-standard-erc20 (deploy MockUSDT that returns void on transfer)
+- oracle-manipulation-via-mock (MockChainlink returning stale data)
+
+### CATEGORY 4: UNTESTABLE
+Cannot be proven with on-chain deterministic execution. DeTest marks these INCONCLUSIVE with a precise reason. No test is written.
+
+Bug classes that are UNTESTABLE and why:
+- mempool-front-running: Forge has no mempool. Transaction ordering cannot be tested. The vulnerability (missing slippage) is testable as STANDARD; the attack vector (someone jumps ahead in mempool) is not.
+- validator-prevrandao-manipulation: vm.prevrandao exists but setting it does not prove a validator can influence it in production. Proves nothing.
+- dvn-collusion: Requires off-chain human actors making coordinated decisions. No on-chain proof possible.
+- solver-collusion: Same as above.
+- cross-chain-state-lag: The async timing window between lzRead query and lzReceive delivery cannot be simulated. The state can be read but the race condition timing cannot be proven.
+- economic-lvr: Loss-versus-rebalancing is a continuous economic property of AMMs against external markets. The mechanism can be shown but profitability cannot be proven on-chain.
+- deployment-front-running: Requires mempool observation. Same as mempool-front-running.
+- bytecode-verification-mismatch: A tooling/build concern, not a runtime property. No on-chain test possible.
+
+---
+
+## 6. TEST WRITING RULES
+
+### 6.1 FILE NAMING AND LOCATION
+All DeTest-generated tests are written to:
+test/detest/{ContractName}_{bugClass}_{findingNumber}.t.sol
+
+Example: test/detest/Vault_reentrancy_1.t.sol
+
+DeTest never writes to the project's existing test/ directory outside of test/detest/. It never modifies existing test files.
+
+### 6.2 IMPORTS AND SETUP
+Before writing any test, DeTest:
+1. Reads foundry.toml to extract remappings. Never hardcode import paths — always use remapped paths.
+2. Reads the target contract source to understand constructor arguments, dependencies, and state variables.
+3. Identifies what needs to be deployed in setUp(): the target contract, any dependencies, any mocks.
+4. Never writes markdown fences (``` ```) inside .t.sol files. The file must be raw Solidity.
+
+Standard test file structure:
+
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.x; // match the target contract's pragma
+
+import {Test} from "forge-std/Test.sol";
+import {TargetContract} from "{remapped-path}/TargetContract.sol";
+// additional imports as needed
+
+contract DeTest_{ContractName}_{BugClass} is Test {
+    TargetContract target;
+    address attacker = makeAddr("attacker");
+    address victim = makeAddr("victim");
+    address owner = makeAddr("owner");
+
+    function setUp() public {
+        // deploy target with appropriate constructor args
+        // set up initial state
+        // label addresses for readable traces
+        vm.label(address(target), "Target");
+        vm.label(attacker, "Attacker");
+    }
+
+    function test_{bugClass}_proof() public {
+        // arrange: set up the exact state from pashov's proof field
+        // act: execute the attack path from pashov's path field
+        // assert: prove the impact described in pashov's description
+    }
+}
+
+### 6.3 INVARIANT TEST STRUCTURE
+Used when bug_class maps to a property violation (solvency, conservation, supply integrity).
+
+Handler pattern is mandatory for invariant tests:
+- Handler contract wraps the target and constrains inputs with bound()
+- Ghost variables track cumulative state (ghost_depositSum, ghost_withdrawSum)
+- targetContract(address(handler)) in setUp()
+- invariant_ function checks the property pashov claims is violated
+- fail_on_revert = false in foundry.toml so handler reverts don't abort the run
+
+### 6.4 FUZZ TEST STRUCTURE
+Used when bug_class involves arithmetic, boundary conditions, or input validation.
+
+Rules:
+- Always use bound() not vm.assume()
+- Parameter names should be meaningful: uint256 depositAmount not uint256 x
+- Assert both that valid inputs work AND that the edge case breaks something
+- If pashov's proof field contains specific trigger values, add a concrete unit test alongside the fuzz test to pin that exact case
+
+### 6.5 MOCK CONTRACT RULES
+When writing mock contracts inline in test files:
+- Keep mocks minimal — only implement what the test needs
+- Name them clearly: MockFlashLender, MockEndpoint, MockUSDT
+- Mock contracts go in the same .t.sol file, above the test contract
+- Never import mock contracts from the project's existing mocks/ directory — write fresh targeted mocks
+
+### 6.6 FORK TEST RULES
+When writing fork tests:
+- Always pin to a specific block: vm.createSelectFork(url, blockNumber)
+- Read the block number from foundry.toml [profile.default] fork_block_number if set, otherwise use a recent stable block
+- Use deal() to set token balances — never acquire through protocol functions
+- Document the fork block in a comment at the top of the test file
+- Keep fork tests isolated: one fork per test file
+
+---
+
+## 7. THE RUN → INTERPRET → ITERATE LOOP
+
+### 7.1 EXECUTION
+DeTest runs each test with:
+forge test --match-path test/detest/{filename}.t.sol -vvvv --no-match-test "invariant_"
+
+For invariant tests:
+forge test --match-path test/detest/{filename}.t.sol -vvvv --match-test "invariant_"
+
+### 7.2 INTERPRETING FORGE OUTPUT
+DeTest reads the raw forge output and identifies one of three outcomes:
+
+OUTCOME A — TEST PASSES
+The test function returns [PASS]. The exploit path executed successfully.
+→ Read the trace to confirm it matches pashov's path field.
+→ If trace matches: verdict = CONFIRMED.
+→ If trace doesn't match pashov's path (test passed for wrong reason): flag as CONFIRM-REVIEW, note the discrepancy.
+
+OUTCOME B — TEST FAILS (assertion)
+The test function returns [FAIL: {reason}].
+Sub-cases:
+- Assertion failed (assertEq, assertGt etc.): the exploit did not produce the expected impact. The bug may not exist as described.
+- vm.expectRevert() but no revert: expected revert didn't happen. Access control may be missing.
+- Unexpected revert when none expected: something else broke. Read the trace to identify where.
+→ Iteration allowed: revise the test based on what the trace shows. Max 3 attempts.
+
+OUTCOME C — COMPILATION ERROR
+The test fails to compile.
+Sub-cases:
+- Import not found: re-read foundry.toml remappings, fix the import path
+- Function not found on contract: function name may differ, re-read source
+- Type mismatch: fix the type
+→ Iteration allowed. Max 3 attempts.
+
+### 7.3 ITERATION RULES
+- Max 3 attempts per finding (1 original + 2 revisions)
+- Each revision must be based on what the forge trace or compiler error actually says — not guessing
+- If all 3 attempts fail: verdict = UNCONFIRMED, record the last error
+- Never delete a test file after failure — keep the last version as evidence of attempt
+- Between attempts, re-read the relevant source contract section to check assumptions
+
+### 7.4 LEADS
+LEADs from the pashov report get one attempt only. No iteration. If the test passes on first try: CONFIRMED. If not: UNCONFIRMED. LEADs are not iterated because their exploit path is already incomplete.
+
+---
+
+## 8. VERDICT SYSTEM
+
+Each finding gets exactly one of four verdicts:
+
+CONFIRMED
+A Foundry test passes and the trace confirms the exploit path described in pashov's proof field.
+Evidence: path to .t.sol file + forge test output summary.
+
+UNCONFIRMED
+A test was written and attempted (up to 3 times) but did not produce a passing result.
+Subcases:
+- UNCONFIRMED-ASSERTION: test compiled and ran, assertion failed
+- UNCONFIRMED-COMPILE: test never compiled after 3 attempts
+- UNCONFIRMED-WRONG-PATH: test passed but trace doesn't match pashov's described path
+This does not mean pashov is wrong. It means DeTest could not prove it. The finding should still be reviewed manually.
+
+INCONCLUSIVE
+The finding was classified as UNTESTABLE or FORK-NO-RPC.
+Reason is always documented precisely.
+
+SKIPPED
+Finding was a LEAD and the one attempt produced a compilation error. Recorded but not iterated.
+
+---
+
+## 9. OUTPUT — THE DETEST VERDICT REPORT
+
+DeTest saves its report to:
+assets/findings/{project-name}-detest-verification-{YYYYMMDD-HHMMSS}.md
+
+Report format:
+
+# DeTest Verification Report — {project-name}
+Generated: {timestamp}
+Source audit: {pashov-report-filename}
+
+## Summary
+| Verdict | Count |
+|---|---|
+| CONFIRMED | N |
+| UNCONFIRMED | N |
+| INCONCLUSIVE | N |
+| SKIPPED | N |
+
+---
+
+## Confirmed Findings
+
+### [CONFIRMED] {pashov-title}
+Original confidence: [{score}]
+Contract: {ContractName}.{functionName}
+Bug class: {bug_class}
+Test file: test/detest/{filename}.t.sol
+Forge result: PASS
+Trace summary: {one line describing what the trace showed}
+
+---
+
+## Unconfirmed Findings
+
+### [UNCONFIRMED-{subcase}] {pashov-title}
+Original confidence: [{score}]
+Contract: {ContractName}.{functionName}
+Bug class: {bug_class}
+Test file: test/detest/{filename}.t.sol (last attempt)
+Attempts: {1-3}
+Last forge result: {error or assertion failure message}
+Note: Unconfirmed does not mean safe. Manual review recommended.
+
+---
+
+## Inconclusive Findings
+
+### [INCONCLUSIVE] {pashov-title}
+Original confidence: [{score}]
+Contract: {ContractName}.{functionName}
+Bug class: {bug_class}
+Reason: {precise reason from Section 5 UNTESTABLE list}
+
+---
+
+> DeTest is a mechanical verification layer. A CONFIRMED verdict means a Foundry test passes — it does not guarantee exploitability in production. An UNCONFIRMED verdict does not mean the finding is false. Manual review of all findings is always required.
+
+---
+
+## 10. FOUNDRY CONFIGURATION REQUIREMENTS
+
+DeTest expects a valid foundry.toml in the project root. Before running, DeTest checks for:
+
+Required:
+- [profile.default] section exists
+- src path is set (default: src)
+- test path is set (default: test)
+- remappings are present (DeTest reads these before writing any import)
+
+Optional but checked:
+- eth_rpc_url — if present, FORK category tests are attempted
+- fork_block_number — if present, used for fork test pinning
+
+DeTest adds to foundry.toml if not present:
+
+[fuzz]
+runs = 512
+
+[invariant]
+runs = 256
+depth = 500
+fail_on_revert = false
+
+DeTest never sets ffi = true. If a test would require FFI, it is classified INCONCLUSIVE.
+
+---
+
+## 11. INVOCATION
+
+The skill is invoked as: /detest
+
+Modes:
+- /detest — reads the most recent pashov report in assets/findings/, processes all findings
+- /detest {filename} — processes a specific pashov report file
+- /detest --finding {N} — processes only finding number N from the report
+
+On invocation, DeTest prints a banner and then:
+1. Confirms the pashov report it found and how many findings it contains
+2. Lists what it will attempt vs skip (classification summary)
+3. Asks for confirmation before writing any test files
+4. Proceeds through each finding in order of confidence (highest first)
+5. Reports progress after each finding
+6. Writes the final verdict report
+
+---
+
+## 12. WHAT DETEST IS NOT
+
+DeTest is not a vulnerability scanner. It does not read contracts and look for bugs.
+DeTest is not a replacement for pashov. It is downstream of pashov.
+DeTest is not a judge. UNCONFIRMED does not mean safe.
+DeTest does not handle gas optimization findings — these are out of scope.
+DeTest does not handle centralization risk findings — no on-chain proof possible.
+DeTest does not modify source contracts. It only writes test files.
+DeTest does not use FFI. It does not call Slither, Medusa, or Halmos internally.
+
+---
+
+## 13. FUTURE SCOPE (NOT IN V1)
+
+- Medusa invariant campaign integration (when confirmed working in SPECTRA)
+- Halmos symbolic execution for formally verifying absence of bugs
+- Automatic severity escalation when DeTest confirms a LEAD that pashov rated low confidence
+- CI integration via GitHub Actions — run DeTest on every PR after pashov runs
+- Cross-project finding database — track which bug classes are confirmed most often
+
+---
+
+End of PRD.Resource.txt
+Version 0.1.0
