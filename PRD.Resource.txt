@@ -512,5 +512,91 @@ DeTest does not use FFI. It does not call Slither, Medusa, or Halmos internally.
 
 ---
 
+## 14. V0.2.0 — ISOLATED FOUNDRY WORKSPACE
+
+### Problem Statement
+DeTest v0.1.0 required the target repo to have a valid foundry.toml. This excluded the majority of real-world audit targets which use Hardhat, Truffle, or no framework at all. A security researcher should be able to point DeTest at any Solidity codebase and get results.
+
+### Solution
+DeTest v0.2.0 introduces Phase 0 — an automated workspace setup that runs before any classification or test writing. Phase 0 creates a completely isolated Foundry environment in /tmp/, copies the contracts in, resolves dependencies, and verifies the workspace with forge build. The original repo is never modified.
+
+### Design Decisions
+
+DECISION 1 — Isolated directory vs modifying the repo
+Chosen: isolated /tmp/detest-{project}-{timestamp}/ directory.
+Rejected: modifying the target repo (adding foundry.toml, lib/ etc.)
+Reason: audit targets are not owned by DeTest. Modifying them creates noise in git history, breaks the repo's own tooling, and violates the principle that DeTest is a read-only observer of the codebase.
+
+DECISION 2 — Dependency resolution strategy
+Three-tier approach:
+Tier 1 — Automatic: known dependencies resolved via dependency-map.md + forge install. No user input needed.
+Tier 2 — Interactive: unknown dependencies prompt the user once per prefix. User provides GitHub owner/repo or skips.
+Tier 3 — Partial scope: unresolvable dependencies mark affected contracts as EXCLUDED. Run continues with remaining contracts. EXCLUDED contracts produce INCONCLUSIVE verdicts automatically.
+Rejected: failing the entire run when any dependency is missing.
+Reason: a single missing utility library should not block verification of 10 other findings. Partial results with clear documentation are more useful than no results.
+
+DECISION 3 — forge build as a hard gate
+Phase 0 does not proceed past forge build failure (except for isolated contract exclusions).
+Reason: writing tests against contracts that don't compile produces meaningless results. A broken workspace is worse than no workspace.
+
+DECISION 4 — What DeTest does NOT do with Hardhat
+DeTest does not run Hardhat tests. It does not read Hardhat test files. It does not convert Hardhat config to Foundry config. It only borrows the .sol contract files from Hardhat repos. The Hardhat toolchain is completely ignored.
+
+### Supported Repo Types
+- FOUNDRY: foundry.toml present — fastest path, remappings reused directly
+- HARDHAT: hardhat.config.ts or hardhat.config.js present — contracts copied from contracts/ or src/
+- TRUFFLE: truffle-config.js present — contracts copied from contracts/
+- NODE: package.json present, no framework config — imports scanned for dependency detection
+- PLAIN: just .sol files — imports scanned, dependencies resolved from scratch
+
+### Files Added in v0.2.0
+- references/dependency-map.md — 16 known packages with forge install targets and remappings
+- references/workspace-setup-rules.md — precise 7-step Phase 0 algorithm with failure modes
+
+### Files Modified in v0.2.0
+- SKILL.md — Phase 0 inserted, all steps renumbered, 2 new hard rules added
+- PRD.Resource.txt — this section and Section 15
+- README.md — prerequisites updated, install template updated
+- CHANGELOG.md — v0.2.0 entry documents all changes
+- VERSION — updated to 0.2.0
+
+---
+
+## 15. DEPENDENCY RESOLUTION — DECISION LOG
+
+This section documents the reasoning behind specific dependency resolution decisions so future contributors understand why the system works the way it does.
+
+### Why a mapping table instead of auto-detection?
+forge install requires a GitHub owner/repo — it cannot resolve npm package names automatically. There is no public registry that maps @openzeppelin/contracts to OpenZeppelin/openzeppelin-contracts. The mapping table is the only reliable way to automate this without requiring user input for every package.
+
+### Why 16 packages in the initial mapping table?
+These 16 cover the dependencies that appear in the vast majority of DeFi audit targets:
+OpenZeppelin (contracts + upgradeable), Solmate, Solady, Uniswap (v2/v3/v4 core + periphery + permit2), Chainlink, Aave v3, PRB Math, LayerZero v2, forge-std.
+Solmate is included despite being deprecated because many existing codebases still use it. Solady is included because it is Solmate's active successor and increasingly common in new projects.
+
+### Why interactive resolution for unknown packages?
+The alternative is failing silently (bad — produces wrong results) or failing loudly (bad — blocks the entire run for one missing package). Interactive resolution gives the user control while keeping the run moving. The prompt is designed to be non-blocking: one question, one answer, continue.
+
+### Why mark contracts as EXCLUDED rather than blocking?
+A finding about Vault.sol should not be blocked because a utility library used only by Helper.sol is missing. EXCLUDED is scoped to the contract level, not the run level. This keeps DeTest useful even in complex monorepo structures where some peripheral contracts cannot be resolved.
+
+### Why delete Counter.sol after forge init?
+forge init --no-commit creates a default Counter.sol in src/ and Counter.t.sol in test/. These are noise — they would appear in forge build output and potentially confuse the workspace. They are deleted immediately after init.
+
+### Why not copy the forge build cache from the original repo?
+The original repo's build cache is tied to its specific directory structure and compiler settings. Copying it into a different path (/tmp/) would produce cache misses or wrong results. Starting fresh is more reliable even if slower.
+
+### Why allow partial scope instead of requiring full resolution?
+Security researchers working on bug bounties often have time pressure. A partial result covering 8 of 10 contracts in 20 minutes is more valuable than a complete result covering all 10 contracts after 2 hours of dependency debugging. The EXCLUDED verdict makes the limitation transparent.
+
+### Known limitations of v0.2.0 dependency resolution
+- Monorepos with multiple package.json files: DeTest only reads the root package.json
+- Private GitHub repos as dependencies: forge install will fail — mark as EXCLUDED
+- Git submodules: not followed — only the checked-out files are used
+- Circular dependencies between contracts: forge build will catch these as compiler errors
+- Custom npm registries: not supported — only public GitHub repos via forge install
+
+---
+
 End of PRD.Resource.txt
-Version 0.1.0
+Version 0.2.0
