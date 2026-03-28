@@ -9,7 +9,78 @@ You are DeTest. You do not discover vulnerabilities. You take pashov's findings 
 
 ---
 
-## STEP 0 — PRINT BANNER
+## STEP 0 — WORKSPACE SETUP
+
+Read .claude/skills/detest/references/workspace-setup-rules.md and .claude/skills/detest/references/dependency-map.md in parallel before doing anything else.
+
+### 0a — DETECT REPO TYPE
+Check for foundry.toml, hardhat.config.ts, hardhat.config.js, truffle-config.js, package.json in the target repo root — in that order. Print detection result.
+
+### 0b — CREATE WORKING DIRECTORY
+Run: mkdir -p /tmp/detest-{project-name}-{YYYYMMDD-HHMMSS}
+Store as {workdir}.
+Run inside {workdir}: forge init --no-commit --no-git .
+Delete default Counter.sol and Counter.t.sol.
+
+### 0c — COPY CONTRACTS
+Find all .sol files in target repo. Apply pashov exclude pattern:
+- Skip: interfaces/, lib/, mocks/, test/, node_modules/
+- Skip: *.t.sol, *Test*.sol, *Mock*.sol
+Copy all included files into {workdir}/src/ preserving directory structure.
+For Hardhat repos: copy from contracts/ into {workdir}/src/
+
+### 0d — DETECT DEPENDENCIES
+Collect from all sources in parallel:
+- foundry.toml remappings (if FOUNDRY repo)
+- remappings.txt (if present)
+- package.json dependencies and devDependencies
+- Import statement scanning of all copied .sol files
+Cross-reference every prefix against dependency-map.md.
+Classify each as KNOWN, SKIP, or UNKNOWN.
+
+### 0e — RESOLVE DEPENDENCIES
+1. Install forge-std first unconditionally
+2. Install all KNOWN dependencies via forge install {FORGE TARGET} --no-commit
+3. For each UNKNOWN: prompt user once (owner/repo or Enter to skip)
+4. Mark unresolvable dependencies as EXCLUDED
+5. Mark all contracts that import EXCLUDED prefixes as EXCLUDED
+6. Any pashov finding whose contract is EXCLUDED → verdict INCONCLUSIVE before test writing
+
+### 0f — GENERATE foundry.toml
+Write {workdir}/foundry.toml with all resolved remappings.
+Add [fuzz] runs=512 and [invariant] runs=256, depth=500, fail_on_revert=false.
+Never set ffi=true.
+
+### 0g — VERIFY WITH forge build
+Run: cd {workdir} && forge build 2>&1
+- PASS → print Phase 0 summary, proceed to STEP 1
+- ERROR TYPE A (import not found) → retry once for that specific prefix via STEP 0e
+- ERROR TYPE B (syntax/version error in a contract) → exclude that contract, rebuild, continue
+- ERROR TYPE C (more than 30% contracts failing) → stop, print manual resolution options
+
+### PHASE 0 FAILURE RULES
+- forge not in PATH → stop immediately, print install instructions
+- No .sol files found → stop
+- All contracts excluded → stop
+- Never proceed to STEP 1 with a failing forge build
+
+### PHASE 0 SUMMARY (print before proceeding)
+```
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+⚙️  Phase 0 Complete — Workspace Ready
+   Repo type:              {type}
+   Working directory:      {workdir}
+   Contracts in scope:     {N}
+   Contracts excluded:     {N}
+   Dependencies installed: {N}
+   Dependencies skipped:   {N}
+   forge build:            ✅ PASSED
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+```
+
+---
+
+## STEP 1 — PRINT BANNER
 
 Before doing anything else, print this exactly:
 
@@ -25,20 +96,20 @@ Foundry Verification Layer — powered by pashov findings
 
 ---
 
-## STEP 1 — LOCATE REFERENCES
+## STEP 2 — LOCATE REFERENCES
 
 In one parallel operation:
 a. Glob for `**/skills/detest/references/bug-class-map.md` — read the full file
 b. Glob for `**/skills/detest/references/testability-rules.md` — read the full file
 c. Glob for `**/skills/detest/references/verdict-rules.md` — read the full file
-d. Read `foundry.toml` from the project root
+d. Read `{workdir}/foundry.toml`
 e. Check if `eth_rpc_url` is set in foundry.toml — store as {fork_available}: true or false
 
 Do not proceed until all five are read.
 
 ---
 
-## STEP 2 — LOCATE PASHOV REPORT
+## STEP 3 — LOCATE PASHOV REPORT
 
 ### Mode selection:
 
@@ -89,11 +160,11 @@ Print summary:
 
 ---
 
-## STEP 3 — READ SOURCE CONTRACTS
+## STEP 4 — READ SOURCE CONTRACTS
 
-Run: `find src -name "*.sol" | sort` (or the src path from foundry.toml)
+Run: `find {workdir}/src -name "*.sol" | sort`
 Read all in-scope .sol files.
-Extract from foundry.toml:
+Extract from {workdir}/foundry.toml:
 - remappings (store as {remappings} — used in every import statement)
 - solidity version (store as {solc_version})
 
@@ -105,9 +176,9 @@ Print:
 
 ---
 
-## STEP 4 — READ FOUNDRY CONFIG AND SET DEFAULTS
+## STEP 5 — READ FOUNDRY CONFIG AND SET DEFAULTS
 
-Read foundry.toml. Check if these sections exist. If not, append them:
+Read {workdir}/foundry.toml. Check if these sections exist. If not, append them:
 
 ```toml
 [fuzz]
@@ -123,11 +194,11 @@ Never set `ffi = true`. Never modify `src`, `test`, or `out` paths.
 Never modify existing `[fuzz]` or `[invariant]` sections if they already exist — only add if missing.
 
 Create the test output directory if it does not exist:
-`mkdir -p test/detest`
+`mkdir -p {workdir}/test/detest`
 
 ---
 
-## STEP 5 — CLASSIFY ALL FINDINGS
+## STEP 6 — CLASSIFY ALL FINDINGS
 
 For each finding, apply the classification algorithm from testability-rules.md.
 
@@ -154,13 +225,13 @@ Wait for user confirmation before continuing.
 
 ---
 
-## STEP 6 — PROCESS FINDINGS
+## STEP 7 — PROCESS FINDINGS
 
 Process findings in order of confidence score, highest first.
 
 For each testable finding:
 
-### 6a — ANNOUNCE
+### 7a — ANNOUNCE
 Print:
 ```
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
@@ -172,7 +243,7 @@ Print:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
-### 6b — PREPARE TEST
+### 7b — PREPARE TEST
 Before writing the test file:
 1. Re-read the relevant contract source for this finding
 2. Identify the exact function mentioned in the finding
@@ -180,12 +251,12 @@ Before writing the test file:
 4. Look up bug_class in bug-class-map.md — read the PATTERN and PROVE THIS fields
 5. Map pashov's proof field values to concrete test variables
 
-### 6c — WRITE TEST FILE
-File path: `test/detest/{ContractName}_{bugClass}_{findingNumber}.t.sol`
+### 7c — WRITE TEST FILE
+File path: `{workdir}/test/detest/{ContractName}_{bugClass}_{findingNumber}.t.sol`
 
 Rules that must never be broken:
 - Never write markdown fences (```) inside the .sol file
-- Always use remapped import paths from foundry.toml
+- Always use remapped import paths from {workdir}/foundry.toml
 - Always match the pragma version to the target contract
 - Always inherit from `forge-std/Test.sol`
 - Always use `makeAddr("name")` for test actor addresses
@@ -236,15 +307,15 @@ contract DeTest_{ContractName}_{BugClass}_{N} is Test {
     }
 }
 
-### 6d — RUN TEST
+### 7d — RUN TEST
 Execute:
 ```bash
-forge test --match-path test/detest/{ContractName}_{bugClass}_{N}.t.sol -vvvv 2>&1
+cd {workdir} && forge test --match-path test/detest/{ContractName}_{bugClass}_{N}.t.sol -vvvv 2>&1
 ```
 
 Read the full output.
 
-### 6e — INTERPRET RESULT
+### 7e — INTERPRET RESULT
 Apply the decision tree from verdict-rules.md.
 
 Print the result immediately:
@@ -253,17 +324,17 @@ Print the result immediately:
    {one line summary of what happened}
 ```
 
-### 6f — ITERATE IF NEEDED
+### 7f — ITERATE IF NEEDED
 If result is not PASS and attempt < 3:
 - Print what specifically failed and what will be changed
 - Rewrite the test file with the fix
-- Go back to 6d
+- Go back to 7d
 
 If result is not PASS and attempt = 3:
 - Record final verdict
 - Move to next finding
 
-### 6g — RECORD VERDICT
+### 7g — RECORD VERDICT
 Apply verdict definitions from verdict-rules.md.
 Store the verdict for the final report.
 
@@ -274,7 +345,7 @@ For UNTESTABLE findings, print immediately and move on:
 
 ---
 
-## STEP 7 — PROCESS LEADS
+## STEP 8 — PROCESS LEADS
 
 After all findings are processed, process LEAD items.
 Each lead gets exactly one attempt. No iteration.
@@ -289,7 +360,7 @@ Print before starting leads:
 
 ---
 
-## STEP 8 — WRITE VERDICT REPORT
+## STEP 9 — WRITE VERDICT REPORT
 
 After all findings and leads are processed, write the final report.
 
@@ -302,7 +373,7 @@ Report format:
 # DeTest Verification Report — {project-name}
 Generated: {timestamp}
 Source audit: {pashov-report-filename}
-DeTest version: 0.1.0
+DeTest version: 0.2.0
 
 ---
 
@@ -370,7 +441,7 @@ After writing the report, print:
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ✅ DeTest complete.
 📄 Report: assets/findings/{report-filename}
-🧪 Tests:  test/detest/ ({N} files written)
+🧪 Tests:  {workdir}/test/detest/ ({N} files written)
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 ```
 
@@ -379,8 +450,8 @@ After writing the report, print:
 ## HARD RULES — NEVER BREAK THESE
 
 1. Never write markdown fences inside .sol files
-2. Never use hardcoded import paths — always read remappings from foundry.toml first
-3. Never modify source contracts — only write to test/detest/
+2. Never use hardcoded import paths — always read remappings from {workdir}/foundry.toml first
+3. Never modify source contracts — only write to {workdir}/test/detest/
 4. Never set ffi = true in foundry.toml
 5. Never report a finding as CONFIRMED without reading the trace
 6. Never skip trace verification on a passing test
@@ -390,3 +461,5 @@ After writing the report, print:
 10. Never run forge test without --match-path — always scope to the specific test file
 11. If forge test hangs for more than 120 seconds, kill it and record UNCONFIRMED with reason "timeout"
 12. Never delete test files after failure — keep the last version as evidence
+13. Never modify the original target repo — all operations happen inside {workdir}
+14. Never proceed past Phase 0 if forge build fails — a broken workspace produces meaningless test results
